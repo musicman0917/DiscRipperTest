@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from .models import Disc, DiscType, Title, Track, TrackType
 
@@ -101,11 +102,20 @@ def detect_disc_type(drive: str) -> DiscType | None:
     return None
 
 
-def _run_ffprobe_json(ffprobe_path: str, extra_args: list[str]) -> dict | None:
+class ProbeResult(NamedTuple):
+    data: dict | None
+    stderr: str  # empty on success; the real ffprobe stderr on failure
+
+
+def _run_ffprobe_json(ffprobe_path: str, extra_args: list[str]) -> ProbeResult:
     """Run ffprobe with _SHOW_ENTRIES plus extra_args, parsed as JSON.
 
-    Returns None for anything that should be treated as "nothing here"
-    (used by callers to know when to stop enumerating titles/playlists).
+    data is None for anything that should be treated as "nothing here"
+    (used by callers to know when to stop enumerating titles/playlists);
+    stderr carries ffprobe's actual error text in that case so callers can
+    put something diagnosable in front of the user instead of just "it
+    failed" - e.g. distinguishing "no such playlist" from an AACS/CSS
+    decryption failure.
     Raises FfmpegBuildError if the failure is clearly a missing
     demuxer/protocol rather than a normal probe failure.
     """
@@ -122,7 +132,7 @@ def _run_ffprobe_json(ffprobe_path: str, extra_args: list[str]) -> dict | None:
     except FileNotFoundError as exc:
         raise FfmpegBuildError(f"ffprobe not found at {ffprobe_path!r}") from exc
     except subprocess.TimeoutExpired:
-        return None
+        return ProbeResult(None, "ffprobe timed out (disc may still be spinning up)")
 
     stderr = result.stderr.strip()
     if result.returncode != 0:
@@ -136,13 +146,13 @@ def _run_ffprobe_json(ffprobe_path: str, extra_args: list[str]) -> dict | None:
                 "compiled with libdvdread (DVD) and libbluray (Blu-ray) - e.g. "
                 "the 'full' build from gyan.dev, not a minimal/'essentials' one."
             )
-        return None
+        return ProbeResult(None, stderr or f"ffprobe exited {result.returncode} with no output")
     if not result.stdout.strip():
-        return None
+        return ProbeResult(None, "ffprobe produced no output")
     try:
-        return json.loads(result.stdout)
+        return ProbeResult(json.loads(result.stdout), "")
     except json.JSONDecodeError:
-        return None
+        return ProbeResult(None, "ffprobe produced unparseable output")
 
 
 def _parse_json_to_title(index: int, data: dict) -> Title:
@@ -182,15 +192,16 @@ def _scan_dvd(drive: str, ffprobe_path: str) -> list[Title]:
     root = drive_root(drive)
     titles: list[Title] = []
     for title_num in range(1, 100):
-        data = _run_ffprobe_json(
+        data, stderr = _run_ffprobe_json(
             ffprobe_path, ["-f", "dvdvideo", "-title", str(title_num), root]
         )
         if data is None:
             if title_num == 1:
                 raise DiscScanError(
-                    f"Could not read any titles from {drive} as a DVD. Check "
-                    "that a disc is inserted, the tray is fully closed, and "
-                    "the drive has finished spinning up, then scan again."
+                    f"Could not read any titles from {drive} as a DVD "
+                    f"(ffprobe said: {stderr!r}). Check that a disc is "
+                    "inserted, the tray is fully closed, and the drive has "
+                    "finished spinning up, then scan again."
                 )
             break
         title = _parse_json_to_title(title_num, data)
@@ -216,11 +227,11 @@ def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
 
     titles: list[Title] = []
     if playlist_numbers:
-        last_error: str | None = None
+        last_error = ""
         for num in playlist_numbers:
-            data = _run_ffprobe_json(ffprobe_path, ["-playlist", str(num), target])
+            data, stderr = _run_ffprobe_json(ffprobe_path, ["-playlist", str(num), target])
             if data is None:
-                last_error = f"playlist {num}"
+                last_error = stderr
                 continue
             title = _parse_json_to_title(num, data)
             if title.tracks:
@@ -229,8 +240,10 @@ def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
             raise DiscScanError(
                 f"Found {len(playlist_numbers)} playlist file(s) under "
                 f"BDMV/PLAYLIST on {drive} but ffprobe couldn't read any of "
-                f"them (last failure: {last_error}). Check the disc and your "
-                "libbluray/libaacs setup."
+                f"them (ffprobe said: {last_error!r}). If that mentions AACS "
+                "or a decryption/key error, this disc needs a KEYDB.cfg "
+                "covering it; otherwise check the disc and your libbluray "
+                "setup."
             )
         return titles
 
@@ -238,9 +251,11 @@ def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
     # listable: brute-force probe playlist numbers, stopping after a run of
     # consecutive failures (original, untested-on-real-hardware heuristic).
     consecutive_failures = 0
+    last_error = ""
     for num in range(0, 100):
-        data = _run_ffprobe_json(ffprobe_path, ["-playlist", str(num), target])
+        data, stderr = _run_ffprobe_json(ffprobe_path, ["-playlist", str(num), target])
         if data is None:
+            last_error = stderr
             consecutive_failures += 1
             if consecutive_failures >= 3:
                 break
@@ -254,7 +269,8 @@ def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
         raise DiscScanError(
             f"Could not read any playlists from {drive} as a Blu-ray "
             "(neither BDMV/PLAYLIST listing nor brute-force probing found "
-            "anything). Check that the disc is inserted and readable."
+            f"anything; last ffprobe error: {last_error!r}). Check that the "
+            "disc is inserted and readable."
         )
     return titles
 

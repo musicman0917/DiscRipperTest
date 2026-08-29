@@ -157,3 +157,25 @@ def test_scan_no_disc_structure_raises(tmp_path, fake_ffprobe_env):
     ffprobe = fake_ffprobe_env({})
     with pytest.raises(disc.DiscScanError):
         disc.scan_disc(str(tmp_path), ffprobe)
+
+
+def test_scan_bluray_error_surfaces_real_ffprobe_stderr(tmp_path, fake_ffprobe_env):
+    # Regression test: a real disc (40 valid .mpls files, every probe
+    # failing with an AACS error) used to be reported as just "playlist 39"
+    # with no hint of *why* - the actual ffprobe stderr must reach the user.
+    (tmp_path / "BDMV").mkdir()
+    playlist_dir = tmp_path / "BDMV" / "PLAYLIST"
+    playlist_dir.mkdir()
+    (playlist_dir / "00000.mpls").touch()
+
+    ffprobe = fake_ffprobe_env(
+        {
+            "playlist:0": {
+                "exit": 1,
+                "stdout": "",
+                "stderr": "aacs_open: AACS: Media key not found\n",
+            }
+        }
+    )
+    with pytest.raises(disc.DiscScanError, match="Media key not found"):
+        disc.scan_disc(str(tmp_path), ffprobe)
