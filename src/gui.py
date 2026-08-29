@@ -33,6 +33,7 @@ from .ripper import RipCancelled, RipError, RipProgress, Ripper
 class ScanWorker(QObject):
     finished = Signal(object)  # Disc
     failed = Signal(str)
+    progress = Signal(object)  # (current: int, total: int | None, label: str)
 
     def __init__(self, drive: str, ffprobe_path: str):
         super().__init__()
@@ -41,7 +42,11 @@ class ScanWorker(QObject):
 
     def run(self) -> None:
         try:
-            disc = scan_disc(self.drive, self.ffprobe_path)
+            disc = scan_disc(
+                self.drive,
+                self.ffprobe_path,
+                on_progress=lambda cur, total, label: self.progress.emit((cur, total, label)),
+            )
         except (DiscScanError, FfmpegBuildError) as exc:
             self.failed.emit(str(exc))
         except Exception as exc:  # unexpected - still surface it, don't hang the GUI
@@ -128,8 +133,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(self._build_output_row())
         layout.addLayout(self._build_rip_row())
 
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 1000)
+        self._reset_progress_bar()
         layout.addWidget(self.progress_bar)
 
         self.log_view = QTextEdit()
@@ -224,6 +232,19 @@ class MainWindow(QMainWindow):
     def _log(self, message: str) -> None:
         self.log_view.append(message)
 
+    # -- progress bar / status label -----------------------------------
+
+    def _reset_progress_bar(self) -> None:
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(0)
+
+    def _set_progress_indeterminate(self) -> None:
+        # Qt convention: range (0, 0) makes a QProgressBar show a "busy"
+        # animation instead of a fraction - used whenever we don't know a
+        # total ahead of time (DVD title probing, the Blu-ray brute-force
+        # fallback) so the bar still visibly moves rather than sitting at 0.
+        self.progress_bar.setRange(0, 0)
+
     def _scan_disc(self) -> None:
         if not self.drive_combo.isEnabled():
             QMessageBox.warning(self, "No drive", "No optical drive detected.")
@@ -239,26 +260,42 @@ class MainWindow(QMainWindow):
         drive = self.drive_combo.currentText()
         self.scan_btn.setEnabled(False)
         self.rip_btn.setEnabled(False)
+        self._set_progress_indeterminate()
+        self.status_label.setText(f"Scanning {drive} ...")
         self._log(f"Scanning {drive} ...")
 
         self._scan_thread = QThread()
         self._scan_worker = ScanWorker(drive, ffprobe_path)
         self._scan_worker.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_worker.failed.connect(self._scan_thread.quit)
         self._scan_thread.start()
 
+    def _on_scan_progress(self, progress: tuple) -> None:
+        current, total, label = progress
+        if total:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(current)
+        else:
+            self._set_progress_indeterminate()
+        self.status_label.setText(label)
+
     def _on_scan_finished(self, disc: Disc) -> None:
         self.scan_btn.setEnabled(True)
         self.disc = disc
+        self._reset_progress_bar()
+        self.status_label.setText(f"Found {len(disc.titles)} title(s).")
         self._log(f"Found {len(disc.titles)} title(s) on {disc.drive_letter}.")
         self._populate_titles(disc)
 
     def _on_scan_failed(self, message: str) -> None:
         self.scan_btn.setEnabled(True)
+        self._reset_progress_bar()
+        self.status_label.setText("Scan failed.")
         self._log(f"Scan failed: {message}")
         QMessageBox.critical(self, "Scan failed", message)
 
@@ -344,7 +381,8 @@ class MainWindow(QMainWindow):
         self.rip_btn.setEnabled(False)
         self.scan_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self.progress_bar.setValue(0)
+        self._reset_progress_bar()
+        self.status_label.setText(f"Ripping title {title.index} ...")
         self._log(f"Ripping title {title.index} -> {output_path}")
 
         self._rip_thread = QThread()
@@ -361,13 +399,18 @@ class MainWindow(QMainWindow):
 
     def _on_rip_progress(self, progress: RipProgress) -> None:
         self.progress_bar.setValue(int(progress.fraction * 1000))
+        pct = int(progress.fraction * 100)
+        speed = f" ({progress.speed})" if progress.speed else ""
+        self.status_label.setText(f"Ripping... {pct}%{speed}")
 
     def _on_rip_finished(self) -> None:
         self._log("Rip finished.")
+        self.status_label.setText("Rip finished.")
         self._rip_done()
 
     def _on_rip_failed(self, message: str) -> None:
         self._log(f"Rip failed: {message}")
+        self.status_label.setText("Rip failed.")
         QMessageBox.critical(self, "Rip failed", message)
         self._rip_done()
 

@@ -93,7 +93,7 @@ def test_scan_populates_titles_and_selects_main_feature(app, monkeypatch):
         gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
     )
     disc = _sample_disc()
-    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe: disc)
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
 
     window = gui_module.MainWindow()
     try:
@@ -113,13 +113,67 @@ def test_scan_populates_titles_and_selects_main_feature(app, monkeypatch):
         window.close()
 
 
+def test_scan_progress_updates_status_label_and_progress_bar(app, monkeypatch):
+    monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
+    monkeypatch.setattr(
+        gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
+    )
+    disc = _sample_disc()
+
+    def fake_scan_disc(drive, ffprobe, on_progress=None):
+        if on_progress:
+            # Mirrors what disc.py sends for a Blu-ray with a known playlist
+            # count: a real total, so the bar should go determinate.
+            on_progress(1, 40, "Reading Blu-ray playlist 0 (1/40)...")
+            on_progress(40, 40, "Reading Blu-ray playlist 800 (40/40)...")
+        return disc
+
+    monkeypatch.setattr(gui_module, "scan_disc", fake_scan_disc)
+
+    window = gui_module.MainWindow()
+    try:
+        window.ffmpeg_path_edit.setText("/usr/bin/ffmpeg")
+        window._scan_disc()
+        window._scan_thread.wait(2000)
+        _pump(app)
+
+        # Final state after scan completes: bar reset, status reflects result.
+        assert window.progress_bar.maximum() == 1000
+        assert "Found 2 title(s)" in window.status_label.text()
+    finally:
+        window.close()
+
+
+def test_scan_progress_with_known_total_sets_determinate_range(app, monkeypatch):
+    monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
+    monkeypatch.setattr(
+        gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
+    )
+    window = gui_module.MainWindow()
+    try:
+        window.ffmpeg_path_edit.setText("/usr/bin/ffmpeg")
+        # Call the slot directly - deterministic, no thread timing involved.
+        window._on_scan_progress((5, 40, "Reading Blu-ray playlist 5 (5/40)..."))
+        assert window.progress_bar.minimum() == 0
+        assert window.progress_bar.maximum() == 40
+        assert window.progress_bar.value() == 5
+        assert window.status_label.text() == "Reading Blu-ray playlist 5 (5/40)..."
+
+        # Unknown total (DVD probing) -> busy/indeterminate mode (range 0,0).
+        window._on_scan_progress((3, None, "Reading DVD title 3..."))
+        assert window.progress_bar.minimum() == 0
+        assert window.progress_bar.maximum() == 0
+    finally:
+        window.close()
+
+
 def test_unchecking_track_updates_model_selection(app, monkeypatch):
     monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
     monkeypatch.setattr(
         gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
     )
     disc = _sample_disc()
-    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe: disc)
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
 
     window = gui_module.MainWindow()
     try:
@@ -146,7 +200,7 @@ def test_rip_flow_updates_progress_and_reenables_buttons(app, tmp_path, monkeypa
         gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
     )
     disc = _sample_disc()
-    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe: disc)
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
 
     class FakeRipper:
         def __init__(self, ffmpeg_path):
@@ -220,7 +274,7 @@ def test_rip_requires_tracks_selected(app, tmp_path, monkeypatch):
             )
         ],
     )
-    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe: disc)
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
     monkeypatch.setattr(gui_module.QMessageBox, "warning", staticmethod(lambda *a, **k: None))
 
     window = gui_module.MainWindow()

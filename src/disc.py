@@ -17,12 +17,20 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
 from .models import Disc, DiscType, Title, Track, TrackType
 
 DRIVE_CDROM = 5  # Windows GetDriveType() return value for optical drives.
+
+# Called as (current, total, label) while scanning so the GUI can show
+# something other than a frozen window during a scan that can take a
+# minute or more on a disc with many titles/playlists. total is None when
+# it isn't known ahead of time (DVD, and the brute-force Blu-ray fallback)
+# - callers should show an indeterminate/busy indicator in that case.
+ScanProgressCallback = Callable[[int, int | None, str], None]
 
 # Combined ffprobe query used for every title/playlist probe. Verified
 # against a real ffprobe 6.1.1 to produce the exact JSON shape
@@ -185,13 +193,17 @@ def _parse_json_to_title(index: int, data: dict) -> Title:
     return Title(index=index, duration_seconds=duration, chapters=chapters, tracks=tracks)
 
 
-def _scan_dvd(drive: str, ffprobe_path: str) -> list[Title]:
+def _scan_dvd(
+    drive: str, ffprobe_path: str, on_progress: ScanProgressCallback | None = None
+) -> list[Title]:
     # The dvdvideo demuxer's own range check is `title > tt_srpt->nr_of_srpts`
     # (source: libavformat/dvdvideodec.c), so valid titles are a contiguous
     # 1..N run - one failure means "past the end", no need to keep probing.
     root = drive_root(drive)
     titles: list[Title] = []
     for title_num in range(1, 100):
+        if on_progress:
+            on_progress(title_num, None, f"Reading DVD title {title_num}...")
         data, stderr = _run_ffprobe_json(
             ffprobe_path, ["-f", "dvdvideo", "-title", str(title_num), root]
         )
@@ -211,7 +223,9 @@ def _scan_dvd(drive: str, ffprobe_path: str) -> list[Title]:
     return titles
 
 
-def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
+def _scan_bluray(
+    drive: str, ffprobe_path: str, on_progress: ScanProgressCallback | None = None
+) -> list[Title]:
     root = drive_root(drive)
     target = "bluray:" + root.replace("\\", "/")
     playlist_dir = Path(root) / "BDMV" / "PLAYLIST"
@@ -227,8 +241,11 @@ def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
 
     titles: list[Title] = []
     if playlist_numbers:
+        total = len(playlist_numbers)
         last_error = ""
-        for num in playlist_numbers:
+        for i, num in enumerate(playlist_numbers, start=1):
+            if on_progress:
+                on_progress(i, total, f"Reading Blu-ray playlist {num} ({i}/{total})...")
             data, stderr = _run_ffprobe_json(ffprobe_path, ["-playlist", str(num), target])
             if data is None:
                 last_error = stderr
@@ -253,6 +270,8 @@ def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
     consecutive_failures = 0
     last_error = ""
     for num in range(0, 100):
+        if on_progress:
+            on_progress(num, None, f"Probing Blu-ray playlist {num}...")
         data, stderr = _run_ffprobe_json(ffprobe_path, ["-playlist", str(num), target])
         if data is None:
             last_error = stderr
@@ -275,7 +294,9 @@ def _scan_bluray(drive: str, ffprobe_path: str) -> list[Title]:
     return titles
 
 
-def scan_disc(drive: str, ffprobe_path: str) -> Disc:
+def scan_disc(
+    drive: str, ffprobe_path: str, on_progress: ScanProgressCallback | None = None
+) -> Disc:
     disc_type = detect_disc_type(drive)
     if disc_type is None:
         raise DiscScanError(
@@ -283,7 +304,7 @@ def scan_disc(drive: str, ffprobe_path: str) -> Disc:
             f"of {drive}. Is a disc inserted?"
         )
     if disc_type is DiscType.DVD:
-        titles = _scan_dvd(drive, ffprobe_path)
+        titles = _scan_dvd(drive, ffprobe_path, on_progress)
     else:
-        titles = _scan_bluray(drive, ffprobe_path)
+        titles = _scan_bluray(drive, ffprobe_path, on_progress)
     return Disc(drive_letter=drive, disc_type=disc_type, titles=titles)
