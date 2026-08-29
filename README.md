@@ -82,6 +82,16 @@ from "disc unreadable"). If that directory somehow isn't listable, it
 falls back to the original brute-force probe (stop after 3 consecutive
 failures) as a safety net.
 
+### Disc title/label detection
+
+`disc.py`'s `disc_label()` gives the app something better than a drive
+letter to show/name files with. For Blu-ray it first tries the
+studio-authored `BDMV/META/DL/bdmt_*.xml` (when present - e.g. "Yu Yu
+Hakusho: Season 4, Disc 1" instead of a raw volume label), falling back to
+the disc's filesystem volume label (`GetVolumeInformationW`, Windows-only)
+for both DVD and Blu-ray. The GUI uses it for the window title, scan
+status, and as a filename prefix on ripped `.mkv` files.
+
 ### Progress parsing
 
 `ffmpeg -progress pipe:1 -nostats` emits `key=value` lines terminated by

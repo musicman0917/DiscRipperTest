@@ -20,6 +20,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
+from xml.etree import ElementTree
 
 from .models import Disc, DiscType, Title, Track, TrackType
 
@@ -108,6 +109,65 @@ def detect_disc_type(drive: str) -> DiscType | None:
     if (root / "VIDEO_TS").is_dir():
         return DiscType.DVD
     return None
+
+
+def _read_bluray_disc_name(root: Path) -> str | None:
+    """Best-effort read of the disc's own title from studio-authored
+    metadata at BDMV/META/DL/bdmt_*.xml, when present - e.g. "Yu Yu
+    Hakusho: Season 4, Disc 1" instead of a raw volume label like
+    "YUYUHAKUSHO_S4D1". Not every disc has this; callers should fall back
+    to the volume label when it's missing or unparseable."""
+    meta_dir = root / "BDMV" / "META" / "DL"
+    if not meta_dir.is_dir():
+        return None
+    for path in sorted(meta_dir.glob("bdmt_*.xml")):
+        try:
+            tree = ElementTree.parse(path)
+        except (ElementTree.ParseError, OSError):
+            continue
+        # Namespaces vary by authoring tool; match any "name" element
+        # rather than pinning to a specific namespace URI.
+        name_elem = tree.getroot().find(".//{*}name")
+        if name_elem is not None and name_elem.text and name_elem.text.strip():
+            return name_elem.text.strip()
+    return None
+
+
+def _read_volume_label(drive: str) -> str | None:
+    """The disc's filesystem volume label (UDF/ISO9660) - works for both
+    DVD and Blu-ray, and is usually set by the publisher to something
+    disc-identifying even when there's no richer metadata available.
+    Windows-only; returns None elsewhere so scanning stays usable in a
+    non-Windows dev/test environment."""
+    if sys.platform != "win32":
+        return None
+
+    import ctypes
+
+    root = drive_root(drive)
+    volume_name_buf = ctypes.create_unicode_buffer(261)
+    ok = ctypes.windll.kernel32.GetVolumeInformationW(  # type: ignore[attr-defined]
+        ctypes.c_wchar_p(root),
+        volume_name_buf,
+        ctypes.sizeof(volume_name_buf),
+        None,
+        None,
+        None,
+        None,
+        0,
+    )
+    if not ok:
+        return None
+    label = volume_name_buf.value.strip()
+    return label or None
+
+
+def disc_label(drive: str, disc_type: DiscType) -> str | None:
+    if disc_type is DiscType.BLURAY:
+        name = _read_bluray_disc_name(Path(drive_root(drive)))
+        if name:
+            return name
+    return _read_volume_label(drive)
 
 
 class ProbeResult(NamedTuple):
@@ -307,4 +367,5 @@ def scan_disc(
         titles = _scan_dvd(drive, ffprobe_path, on_progress)
     else:
         titles = _scan_bluray(drive, ffprobe_path, on_progress)
-    return Disc(drive_letter=drive, disc_type=disc_type, titles=titles)
+    label = disc_label(drive, disc_type)
+    return Disc(drive_letter=drive, disc_type=disc_type, label=label, titles=titles)

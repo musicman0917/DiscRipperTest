@@ -179,3 +179,78 @@ def test_scan_bluray_error_surfaces_real_ffprobe_stderr(tmp_path, fake_ffprobe_e
     )
     with pytest.raises(disc.DiscScanError, match="Media key not found"):
         disc.scan_disc(str(tmp_path), ffprobe)
+
+
+def test_read_bluray_disc_name_from_metadata(tmp_path):
+    meta_dir = tmp_path / "BDMV" / "META" / "DL"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "bdmt_eng.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<disclib xmlns:di="urn:BDA:bdmv;discinfo" xmlns="urn:BDA:bdmv;discinfo:local">\n'
+        "  <di:discinfo>\n"
+        "    <di:title>\n"
+        "      <di:name>Yu Yu Hakusho: Season 4, Disc 1</di:name>\n"
+        "    </di:title>\n"
+        "  </di:discinfo>\n"
+        "</disclib>\n",
+        encoding="utf-8",
+    )
+    assert disc._read_bluray_disc_name(tmp_path) == "Yu Yu Hakusho: Season 4, Disc 1"
+
+
+def test_read_bluray_disc_name_missing_returns_none(tmp_path):
+    assert disc._read_bluray_disc_name(tmp_path) is None
+
+
+def test_read_bluray_disc_name_malformed_xml_returns_none(tmp_path):
+    meta_dir = tmp_path / "BDMV" / "META" / "DL"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "bdmt_eng.xml").write_text("<not valid xml", encoding="utf-8")
+    assert disc._read_bluray_disc_name(tmp_path) is None
+
+
+def test_disc_label_off_windows_is_none(tmp_path):
+    # _read_volume_label is Windows-only (uses ctypes.windll); off-Windows
+    # a DVD with no metadata source at all should just come back None.
+    assert disc.disc_label(str(tmp_path), DiscType.DVD) is None
+
+
+def test_disc_label_bluray_prefers_metadata_over_volume_label(tmp_path, monkeypatch):
+    meta_dir = tmp_path / "BDMV" / "META" / "DL"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "bdmt_eng.xml").write_text(
+        '<disclib xmlns:di="urn:BDA:bdmv;discinfo"><di:discinfo>'
+        "<di:title><di:name>Yu Yu Hakusho: Season 4, Disc 1</di:name></di:title>"
+        "</di:discinfo></disclib>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(disc, "_read_volume_label", lambda drive: "YUYUHAKUSHO_S4D1")
+    assert (
+        disc.disc_label(str(tmp_path), DiscType.BLURAY)
+        == "Yu Yu Hakusho: Season 4, Disc 1"
+    )
+
+
+def test_disc_label_bluray_falls_back_to_volume_label(tmp_path, monkeypatch):
+    # No BDMV/META/DL at all - should fall back rather than returning None.
+    monkeypatch.setattr(disc, "_read_volume_label", lambda drive: "YUYUHAKUSHO_S4D1")
+    assert disc.disc_label(str(tmp_path), DiscType.BLURAY) == "YUYUHAKUSHO_S4D1"
+
+
+def test_scan_bluray_populates_disc_label(tmp_path, fake_ffprobe_env):
+    (tmp_path / "BDMV").mkdir()
+    playlist_dir = tmp_path / "BDMV" / "PLAYLIST"
+    playlist_dir.mkdir()
+    (playlist_dir / "00000.mpls").touch()
+    meta_dir = tmp_path / "BDMV" / "META" / "DL"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "bdmt_eng.xml").write_text(
+        '<disclib xmlns:di="urn:BDA:bdmv;discinfo"><di:discinfo>'
+        "<di:title><di:name>Yu Yu Hakusho: Season 4, Disc 1</di:name></di:title>"
+        "</di:discinfo></disclib>",
+        encoding="utf-8",
+    )
+
+    ffprobe = fake_ffprobe_env({"playlist:0": {"exit": 0, "stdout": _ffprobe_json(2700)}})
+    result = disc.scan_disc(str(tmp_path), ffprobe)
+    assert result.label == "Yu Yu Hakusho: Season 4, Disc 1"

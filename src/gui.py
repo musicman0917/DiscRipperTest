@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -97,6 +98,14 @@ class RipWorker(QObject):
             self.failed.emit(f"Unexpected error during rip: {exc}")
         else:
             self.finished.emit()
+
+
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_filename_component(text: str) -> str:
+    cleaned = _INVALID_FILENAME_CHARS.sub("_", text).strip(" .")
+    return cleaned or "Disc"
 
 
 class MainWindow(QMainWindow):
@@ -320,8 +329,10 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.disc = disc
         self._reset_progress_bar()
-        self.status_label.setText(f"Found {len(disc.titles)} title(s).")
-        self._log(f"Found {len(disc.titles)} title(s) on {disc.drive_letter}.")
+        disc_name = disc.label or disc.drive_letter
+        self.setWindowTitle(f"DiscRipper - {disc_name}" if disc.label else "DiscRipper")
+        self.status_label.setText(f'Found {len(disc.titles)} title(s) on "{disc_name}".')
+        self._log(f'Found {len(disc.titles)} title(s) on "{disc_name}" ({disc.drive_letter}).')
         self._populate_titles(disc)
 
     def _on_scan_failed(self, message: str) -> None:
@@ -499,7 +510,9 @@ class MainWindow(QMainWindow):
         title = self._rip_queue[self._rip_queue_pos]
         tracks = self._selected_tracks(title)
         output_dir = self.output_dir_edit.text().strip()
-        output_path = Path(output_dir) / f"Title_{title.index:02d}.mkv"
+        disc_label = self.disc.label if self.disc else None
+        prefix = f"{_sanitize_filename_component(disc_label)}_" if disc_label else ""
+        output_path = Path(output_dir) / f"{prefix}Title_{title.index:02d}.mkv"
 
         ffmpeg_path = self.ffmpeg_path_edit.text().strip()
         self.ripper = Ripper(ffmpeg_path)

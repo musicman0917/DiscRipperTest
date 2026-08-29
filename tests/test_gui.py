@@ -263,6 +263,55 @@ def test_unchecking_track_updates_model_selection(app, monkeypatch):
         window.close()
 
 
+def test_scan_with_disc_label_sets_window_title_and_filename_prefix(
+    app, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
+    monkeypatch.setattr(
+        gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
+    )
+    disc = _sample_disc()
+    disc.label = "Yu Yu Hakusho: Season 4, Disc 1"
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
+
+    captured_paths: list[str] = []
+
+    class FakeRipper:
+        def __init__(self, ffmpeg_path):
+            self.ffmpeg_path = ffmpeg_path
+
+        def rip(self, disc, title, tracks, output_path, on_progress=None, on_log=None):
+            captured_paths.append(str(output_path))
+            output_path.write_bytes(b"fake mkv")
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(gui_module, "Ripper", FakeRipper)
+
+    window = gui_module.MainWindow()
+    try:
+        window.ffmpeg_path_edit.setText("/usr/bin/ffmpeg")
+        window._scan_disc()
+        window._scan_thread.wait(2000)
+        _pump(app)
+
+        assert window.windowTitle() == "DiscRipper - Yu Yu Hakusho: Season 4, Disc 1"
+        assert "Yu Yu Hakusho: Season 4, Disc 1" in window.status_label.text()
+
+        window.output_dir_edit.setText(str(tmp_path))
+        window._start_rip()
+        assert window._rip_thread is not None
+        window._rip_thread.wait(2000)
+        _pump(app)
+
+        assert captured_paths == [
+            str(tmp_path / "Yu Yu Hakusho_ Season 4, Disc 1_Title_02.mkv")
+        ]
+    finally:
+        window.close()
+
+
 def test_rip_flow_updates_progress_and_reenables_buttons(app, tmp_path, monkeypatch):
     monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
     monkeypatch.setattr(
