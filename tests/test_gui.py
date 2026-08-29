@@ -120,6 +120,66 @@ def test_scan_populates_titles_and_selects_main_feature(app, monkeypatch):
         window.close()
 
 
+def test_duration_filter_hides_short_titles_and_scopes_select_all(app, monkeypatch):
+    from PySide6.QtCore import Qt
+
+    monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
+    monkeypatch.setattr(
+        gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
+    )
+    disc = Disc(
+        drive_letter="G:",
+        disc_type=DiscType.BLURAY,
+        titles=[
+            Title(
+                index=0,
+                duration_seconds=45,  # menu/trailer - under the 2 min default
+                tracks=[Track(stream_index=0, track_type=TrackType.VIDEO, codec="h264")],
+            ),
+            Title(
+                index=1,
+                duration_seconds=2700,  # real content
+                tracks=[Track(stream_index=0, track_type=TrackType.VIDEO, codec="h264")],
+            ),
+            Title(
+                index=2,
+                duration_seconds=2600,  # also real content
+                tracks=[Track(stream_index=0, track_type=TrackType.VIDEO, codec="h264")],
+            ),
+        ],
+    )
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
+
+    window = gui_module.MainWindow()
+    try:
+        window.ffmpeg_path_edit.setText("/usr/bin/ffmpeg")
+        window._scan_disc()
+        window._scan_thread.wait(2000)
+        _pump(app)
+
+        # Default filter (2 min) hides the 45s title but not the others.
+        assert window.min_duration_spin.value() == 2
+        items = [window.title_tree.topLevelItem(i) for i in range(3)]
+        hidden_by_index = {
+            item.data(0, Qt.ItemDataRole.UserRole).index: item.isHidden() for item in items
+        }
+        assert hidden_by_index == {0: True, 1: False, 2: False}
+
+        # Select All must only check what's actually visible.
+        window._set_all_titles_checked(True)
+        assert {t.index for t in window._checked_titles()} == {1, 2}
+
+        # Raising the filter past everything hides all three...
+        window.min_duration_spin.setValue(60)
+        assert all(item.isHidden() for item in items)
+
+        # ...and dropping it back to 0 reveals them again.
+        window.min_duration_spin.setValue(0)
+        assert not any(item.isHidden() for item in items)
+    finally:
+        window.close()
+
+
 def test_scan_progress_updates_status_label_and_progress_bar(app, monkeypatch):
     monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
     monkeypatch.setattr(

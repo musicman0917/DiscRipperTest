@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -184,6 +185,13 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         header.addWidget(QLabel("Titles (check the ones to rip):"))
         header.addStretch(1)
+        header.addWidget(QLabel("Hide shorter than:"))
+        self.min_duration_spin = QSpinBox()
+        self.min_duration_spin.setRange(0, 999)
+        self.min_duration_spin.setValue(2)
+        self.min_duration_spin.setSuffix(" min")
+        self.min_duration_spin.valueChanged.connect(self._apply_title_filter)
+        header.addWidget(self.min_duration_spin)
         select_all_btn = QPushButton("Select All")
         select_all_btn.clicked.connect(lambda: self._set_all_titles_checked(True))
         header.addWidget(select_all_btn)
@@ -339,14 +347,45 @@ class MainWindow(QMainWindow):
             if is_main_feature:
                 main_feature_item = item
 
-        focus_item = main_feature_item or (
-            self.title_tree.topLevelItem(0) if self.title_tree.topLevelItemCount() else None
+        self._apply_title_filter()
+
+        focus_item = (
+            main_feature_item
+            if main_feature_item is not None and not main_feature_item.isHidden()
+            else self._first_visible_title_item()
         )
         if focus_item is not None:
             self.title_tree.setCurrentItem(focus_item)
             self._on_title_focused(focus_item, None)
 
         self.rip_btn.setEnabled(self.title_tree.topLevelItemCount() > 0)
+
+    def _first_visible_title_item(self) -> QTreeWidgetItem | None:
+        for i in range(self.title_tree.topLevelItemCount()):
+            item = self.title_tree.topLevelItem(i)
+            if not item.isHidden():
+                return item
+        return None
+
+    def _apply_title_filter(self) -> None:
+        min_seconds = self.min_duration_spin.value() * 60
+        for i in range(self.title_tree.topLevelItemCount()):
+            item = self.title_tree.topLevelItem(i)
+            title: Title | None = item.data(0, Qt.ItemDataRole.UserRole)
+            if title is None:
+                continue
+            item.setHidden(title.duration_seconds < min_seconds)
+
+        # If the filter just hid whichever title was being previewed below,
+        # fall back to the next visible one instead of showing stale tracks.
+        current = self.title_tree.currentItem()
+        if current is not None and current.isHidden():
+            fallback = self._first_visible_title_item()
+            if fallback is not None:
+                self.title_tree.setCurrentItem(fallback)
+                self._on_title_focused(fallback, None)
+            else:
+                self.track_tree.clear()
 
     def _on_title_focused(self, current: QTreeWidgetItem | None, _previous) -> None:
         self.track_tree.clear()
@@ -367,8 +406,13 @@ class MainWindow(QMainWindow):
             self.track_tree.setItemWidget(item, 1, checkbox)
 
     def _set_all_titles_checked(self, checked: bool) -> None:
+        # Scoped to visible rows only, so "Select All" with a duration
+        # filter active means "all real content," not "everything
+        # including the menus/trailers I just asked to hide."
         for i in range(self.title_tree.topLevelItemCount()):
             item = self.title_tree.topLevelItem(i)
+            if item.isHidden():
+                continue
             checkbox = self.title_tree.itemWidget(item, 1)
             if checkbox is not None:
                 checkbox.setChecked(checked)
