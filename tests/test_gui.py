@@ -103,10 +103,17 @@ def test_scan_populates_titles_and_selects_main_feature(app, monkeypatch):
         window._scan_thread.wait(2000)
         _pump(app)
 
-        assert window.title_combo.count() == 2
-        # main_feature is the 5400s title (index 2) - should be auto-selected.
-        selected_title: Title = window.title_combo.itemData(window.title_combo.currentIndex())
+        assert window.title_tree.topLevelItemCount() == 2
+        # main_feature is the 5400s title (index 2) - should be highlighted
+        # (for track preview) and its checkbox pre-checked (for batch rip),
+        # while the other title starts unchecked.
+        current = window.title_tree.currentItem()
+        from PySide6.QtCore import Qt
+
+        selected_title: Title = current.data(0, Qt.ItemDataRole.UserRole)
         assert selected_title.index == 2
+        checked = {t.index for t in window._checked_titles()}
+        assert checked == {2}
         assert window.track_tree.topLevelItemCount() == 2
         assert window.rip_btn.isEnabled()
     finally:
@@ -182,7 +189,9 @@ def test_unchecking_track_updates_model_selection(app, monkeypatch):
         window._scan_thread.wait(2000)
         _pump(app)
 
-        title: Title = window.title_combo.itemData(window.title_combo.currentIndex())
+        from PySide6.QtCore import Qt
+
+        title: Title = window.title_tree.currentItem().data(0, Qt.ItemDataRole.UserRole)
         audio_track = title.audio_tracks[0]
         assert audio_track.selected is True
 
@@ -247,6 +256,116 @@ def test_rip_flow_updates_progress_and_reenables_buttons(app, tmp_path, monkeypa
         assert not window.cancel_btn.isEnabled()
         assert (tmp_path / "Title_02.mkv").exists()
         assert "Running: fake ffmpeg command" in window.log_view.toPlainText()
+    finally:
+        window.close()
+
+
+def test_batch_rip_processes_all_checked_titles(app, tmp_path, monkeypatch):
+    monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
+    monkeypatch.setattr(
+        gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
+    )
+    disc = _sample_disc()
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
+
+    ripped_titles: list[int] = []
+
+    class FakeRipper:
+        def __init__(self, ffmpeg_path):
+            self.ffmpeg_path = ffmpeg_path
+
+        def rip(self, disc, title, tracks, output_path, on_progress=None, on_log=None):
+            ripped_titles.append(title.index)
+            output_path.write_bytes(b"fake mkv")
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(gui_module, "Ripper", FakeRipper)
+
+    window = gui_module.MainWindow()
+    try:
+        window.ffmpeg_path_edit.setText("/usr/bin/ffmpeg")
+        window._scan_disc()
+        window._scan_thread.wait(2000)
+        _pump(app)
+
+        # Only the main feature (title 2) is checked by default - this is
+        # the "select all videos on the disc" opt-in the feature adds.
+        assert {t.index for t in window._checked_titles()} == {2}
+        window._set_all_titles_checked(True)
+        assert {t.index for t in window._checked_titles()} == {1, 2}
+
+        window.output_dir_edit.setText(str(tmp_path))
+        window._start_rip()
+
+        # Batch runs one title's QThread at a time, chained via signals -
+        # poll until the queue drains (rip_btn re-enables) or give up.
+        for _ in range(10):
+            if window.rip_btn.isEnabled():
+                break
+            if window._rip_thread is not None:
+                window._rip_thread.wait(2000)
+            _pump(app, 200)
+
+        assert window.rip_btn.isEnabled()
+        assert not window.cancel_btn.isEnabled()
+        assert sorted(ripped_titles) == [1, 2]
+        assert (tmp_path / "Title_01.mkv").exists()
+        assert (tmp_path / "Title_02.mkv").exists()
+        assert "Batch finished: 2/2 title(s) ripped." in window.log_view.toPlainText()
+    finally:
+        window.close()
+
+
+def test_cancel_stops_batch_and_reenables_buttons(app, tmp_path, monkeypatch):
+    # Regression test: RipWorker used to have no `cancelled` signal, so a
+    # RipCancelled from the ripper fired neither `finished` nor `failed` -
+    # the UI stayed stuck with rip_btn disabled forever after a cancel.
+    monkeypatch.setattr(gui_module, "list_optical_drives", lambda: ["G:"])
+    monkeypatch.setattr(
+        gui_module.Config, "load", staticmethod(lambda: gui_module.Config())
+    )
+    disc = _sample_disc()
+    monkeypatch.setattr(gui_module, "scan_disc", lambda drive, ffprobe, on_progress=None: disc)
+
+    attempted: list[int] = []
+
+    class FakeRipper:
+        def __init__(self, ffmpeg_path):
+            self.ffmpeg_path = ffmpeg_path
+
+        def rip(self, disc, title, tracks, output_path, on_progress=None, on_log=None):
+            from src.ripper import RipCancelled
+
+            attempted.append(title.index)
+            raise RipCancelled(f"cancelled title {title.index}")
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(gui_module, "Ripper", FakeRipper)
+
+    window = gui_module.MainWindow()
+    try:
+        window.ffmpeg_path_edit.setText("/usr/bin/ffmpeg")
+        window._scan_disc()
+        window._scan_thread.wait(2000)
+        _pump(app)
+
+        window._set_all_titles_checked(True)
+        window.output_dir_edit.setText(str(tmp_path))
+        window._start_rip()
+        assert window._rip_thread is not None
+        window._rip_thread.wait(2000)
+        _pump(app)
+
+        # Only the first queued title should have been attempted - the
+        # batch must stop on cancel, not roll on to the next title.
+        assert attempted == [1]
+        assert window.rip_btn.isEnabled()
+        assert not window.cancel_btn.isEnabled()
+        assert "cancelled" in window.log_view.toPlainText().lower()
     finally:
         window.close()
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -60,6 +60,7 @@ class RipWorker(QObject):
     log = Signal(str)
     finished = Signal()
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(
         self,
@@ -88,6 +89,7 @@ class RipWorker(QObject):
             )
         except RipCancelled:
             self.log.emit("Rip cancelled.")
+            self.cancelled.emit()
         except RipError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
@@ -111,6 +113,12 @@ class MainWindow(QMainWindow):
         self._rip_thread: QThread | None = None
         self._rip_worker: RipWorker | None = None
 
+        # Batch rip queue: rip multiple checked titles one after another.
+        self._rip_queue: list[Title] = []
+        self._rip_queue_pos = 0
+        self._rip_results: list[tuple[Title, bool, str]] = []
+        self._batch_cancelled = False
+
         self._build_ui()
         self._refresh_drives()
 
@@ -123,8 +131,9 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(self._build_ffmpeg_row())
         layout.addLayout(self._build_drive_row())
-        layout.addLayout(self._build_title_row())
+        layout.addLayout(self._build_title_section())
 
+        layout.addWidget(QLabel("Tracks (of the highlighted title above):"))
         self.track_tree = QTreeWidget()
         self.track_tree.setHeaderLabels(["Track", "Rip?"])
         self.track_tree.setColumnWidth(0, 500)
@@ -170,13 +179,28 @@ class MainWindow(QMainWindow):
         row.addWidget(self.scan_btn)
         return row
 
-    def _build_title_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Title:"))
-        self.title_combo = QComboBox()
-        self.title_combo.currentIndexChanged.connect(self._on_title_selected)
-        row.addWidget(self.title_combo, 1)
-        return row
+    def _build_title_section(self) -> QVBoxLayout:
+        section = QVBoxLayout()
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Titles (check the ones to rip):"))
+        header.addStretch(1)
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(lambda: self._set_all_titles_checked(True))
+        header.addWidget(select_all_btn)
+        select_none_btn = QPushButton("Select None")
+        select_none_btn.clicked.connect(lambda: self._set_all_titles_checked(False))
+        header.addWidget(select_none_btn)
+        section.addLayout(header)
+
+        self.title_tree = QTreeWidget()
+        self.title_tree.setHeaderLabels(["Title", "Rip?"])
+        self.title_tree.setColumnWidth(0, 500)
+        self.title_tree.setMaximumHeight(160)
+        # Highlighting (not checking) a row previews/edits its own track
+        # selection below - the checkbox is what actually queues it for rip.
+        self.title_tree.currentItemChanged.connect(self._on_title_focused)
+        section.addWidget(self.title_tree)
+        return section
 
     def _build_output_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -190,7 +214,7 @@ class MainWindow(QMainWindow):
 
     def _build_rip_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        self.rip_btn = QPushButton("Rip")
+        self.rip_btn = QPushButton("Rip Selected")
         self.rip_btn.clicked.connect(self._start_rip)
         self.rip_btn.setEnabled(False)
         row.addWidget(self.rip_btn)
@@ -300,27 +324,36 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Scan failed", message)
 
     def _populate_titles(self, disc: Disc) -> None:
-        self.title_combo.blockSignals(True)
-        self.title_combo.clear()
-        main_feature = disc.main_feature
-        selected_row = 0
-        for row, title in enumerate(disc.titles):
-            self.title_combo.addItem(title.label, userData=title)
-            if main_feature is not None and title.index == main_feature.index:
-                selected_row = row
-        self.title_combo.blockSignals(False)
-        if disc.titles:
-            self.title_combo.setCurrentIndex(selected_row)
-            self._on_title_selected(selected_row)
-
-    def _on_title_selected(self, row: int) -> None:
+        self.title_tree.clear()
         self.track_tree.clear()
-        if row < 0 or self.disc is None:
-            self.rip_btn.setEnabled(False)
+        main_feature = disc.main_feature
+        main_feature_item = None
+        for title in disc.titles:
+            item = QTreeWidgetItem([title.label])
+            item.setData(0, Qt.ItemDataRole.UserRole, title)
+            checkbox = QCheckBox()
+            is_main_feature = main_feature is not None and title.index == main_feature.index
+            checkbox.setChecked(is_main_feature)
+            self.title_tree.addTopLevelItem(item)
+            self.title_tree.setItemWidget(item, 1, checkbox)
+            if is_main_feature:
+                main_feature_item = item
+
+        focus_item = main_feature_item or (
+            self.title_tree.topLevelItem(0) if self.title_tree.topLevelItemCount() else None
+        )
+        if focus_item is not None:
+            self.title_tree.setCurrentItem(focus_item)
+            self._on_title_focused(focus_item, None)
+
+        self.rip_btn.setEnabled(self.title_tree.topLevelItemCount() > 0)
+
+    def _on_title_focused(self, current: QTreeWidgetItem | None, _previous) -> None:
+        self.track_tree.clear()
+        if current is None:
             return
-        title: Title | None = self.title_combo.itemData(row)
+        title: Title | None = current.data(0, Qt.ItemDataRole.UserRole)
         if title is None:
-            self.rip_btn.setEnabled(False)
             return
 
         for track in title.tracks:
@@ -333,7 +366,23 @@ class MainWindow(QMainWindow):
             self.track_tree.addTopLevelItem(item)
             self.track_tree.setItemWidget(item, 1, checkbox)
 
-        self.rip_btn.setEnabled(True)
+    def _set_all_titles_checked(self, checked: bool) -> None:
+        for i in range(self.title_tree.topLevelItemCount()):
+            item = self.title_tree.topLevelItem(i)
+            checkbox = self.title_tree.itemWidget(item, 1)
+            if checkbox is not None:
+                checkbox.setChecked(checked)
+
+    def _checked_titles(self) -> list[Title]:
+        titles = []
+        for i in range(self.title_tree.topLevelItemCount()):
+            item = self.title_tree.topLevelItem(i)
+            checkbox = self.title_tree.itemWidget(item, 1)
+            if checkbox is not None and checkbox.isChecked():
+                title = item.data(0, Qt.ItemDataRole.UserRole)
+                if title is not None:
+                    titles.append(title)
+        return titles
 
     # -- output folder -----------------------------------------------------
 
@@ -344,13 +393,7 @@ class MainWindow(QMainWindow):
             self.config.last_output_dir = path
             self.config.save()
 
-    # -- rip -----------------------------------------------------------
-
-    def _selected_title(self) -> Title | None:
-        row = self.title_combo.currentIndex()
-        if row < 0:
-            return None
-        return self.title_combo.itemData(row)
+    # -- rip (batch queue over checked titles) --------------------------
 
     def _selected_tracks(self, title: Title) -> list[Track]:
         return [t for t in title.tracks if t.selected]
@@ -358,12 +401,11 @@ class MainWindow(QMainWindow):
     def _start_rip(self) -> None:
         if self.disc is None:
             return
-        title = self._selected_title()
-        if title is None:
-            return
-        tracks = self._selected_tracks(title)
-        if not tracks:
-            QMessageBox.warning(self, "No tracks selected", "Select at least one track.")
+        checked_titles = self._checked_titles()
+        if not checked_titles:
+            QMessageBox.warning(
+                self, "No titles selected", "Check at least one title to rip."
+            )
             return
 
         output_dir = self.output_dir_edit.text().strip()
@@ -373,17 +415,55 @@ class MainWindow(QMainWindow):
         self.config.last_output_dir = output_dir
         self.config.save()
 
-        output_path = Path(output_dir) / f"Title_{title.index:02d}.mkv"
+        queue = []
+        skipped = []
+        for title in checked_titles:
+            if self._selected_tracks(title):
+                queue.append(title)
+            else:
+                skipped.append(title.index)
+        if skipped:
+            self._log(
+                "Skipping title(s) with no tracks selected: "
+                + ", ".join(str(i) for i in skipped)
+            )
+        if not queue:
+            QMessageBox.warning(
+                self,
+                "No tracks selected",
+                "None of the checked titles have any tracks selected.",
+            )
+            return
 
-        ffmpeg_path = self.ffmpeg_path_edit.text().strip()
-        self.ripper = Ripper(ffmpeg_path)
+        self._rip_queue = queue
+        self._rip_queue_pos = 0
+        self._rip_results = []
+        self._batch_cancelled = False
 
         self.rip_btn.setEnabled(False)
         self.scan_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self._reset_progress_bar()
-        self.status_label.setText(f"Ripping title {title.index} ...")
-        self._log(f"Ripping title {title.index} -> {output_path}")
+
+        self._rip_next_in_queue()
+
+    def _rip_next_in_queue(self) -> None:
+        if self._batch_cancelled or self._rip_queue_pos >= len(self._rip_queue):
+            self._finish_rip_batch()
+            return
+
+        title = self._rip_queue[self._rip_queue_pos]
+        tracks = self._selected_tracks(title)
+        output_dir = self.output_dir_edit.text().strip()
+        output_path = Path(output_dir) / f"Title_{title.index:02d}.mkv"
+
+        ffmpeg_path = self.ffmpeg_path_edit.text().strip()
+        self.ripper = Ripper(ffmpeg_path)
+
+        position = f"{self._rip_queue_pos + 1}/{len(self._rip_queue)}"
+        self._reset_progress_bar()
+        self.status_label.setText(f"Ripping title {title.index} ({position}) ...")
+        self._log(f"Ripping title {title.index} ({position}) -> {output_path}")
 
         self._rip_thread = QThread()
         self._rip_worker = RipWorker(self.ripper, self.disc, title, tracks, output_path)
@@ -391,30 +471,85 @@ class MainWindow(QMainWindow):
         self._rip_thread.started.connect(self._rip_worker.run)
         self._rip_worker.progress.connect(self._on_rip_progress)
         self._rip_worker.log.connect(self._log)
-        self._rip_worker.finished.connect(self._on_rip_finished)
-        self._rip_worker.failed.connect(self._on_rip_failed)
+        self._rip_worker.finished.connect(self._on_rip_worker_finished)
+        self._rip_worker.failed.connect(self._on_rip_worker_failed)
+        self._rip_worker.cancelled.connect(self._on_rip_worker_cancelled)
         self._rip_worker.finished.connect(self._rip_thread.quit)
         self._rip_worker.failed.connect(self._rip_thread.quit)
+        self._rip_worker.cancelled.connect(self._rip_thread.quit)
         self._rip_thread.start()
 
     def _on_rip_progress(self, progress: RipProgress) -> None:
         self.progress_bar.setValue(int(progress.fraction * 1000))
         pct = int(progress.fraction * 100)
         speed = f" ({progress.speed})" if progress.speed else ""
-        self.status_label.setText(f"Ripping... {pct}%{speed}")
+        position = f"{self._rip_queue_pos + 1}/{len(self._rip_queue)}"
+        self.status_label.setText(f"Ripping title {position}... {pct}%{speed}")
 
-    def _on_rip_finished(self) -> None:
-        self._log("Rip finished.")
-        self.status_label.setText("Rip finished.")
-        self._rip_done()
+    def _cleanup_rip_thread(self) -> None:
+        # A QThread must not be dropped (and hence garbage-collected) while
+        # its OS thread is still shutting down - the finished/failed/
+        # cancelled signal here fires from a queued cross-thread connection,
+        # which runs *before* the .quit() call queued after it, so at this
+        # point the thread's own event loop may not have processed quit()
+        # yet. Reassigning self._rip_thread/_rip_worker to the next title's
+        # objects without waiting first was crashing the process outright
+        # (PySide6 deleting a QThread that Qt still considers running).
+        if self._rip_thread is not None:
+            self._rip_thread.quit()
+            self._rip_thread.wait()
+            self._rip_thread = None
+            self._rip_worker = None
 
-    def _on_rip_failed(self, message: str) -> None:
-        self._log(f"Rip failed: {message}")
-        self.status_label.setText("Rip failed.")
-        QMessageBox.critical(self, "Rip failed", message)
-        self._rip_done()
+    def _on_rip_worker_finished(self) -> None:
+        title = self._rip_queue[self._rip_queue_pos]
+        self._log(f"Title {title.index} finished.")
+        self._rip_results.append((title, True, ""))
+        self._cleanup_rip_thread()
+        self._rip_queue_pos += 1
+        self._rip_next_in_queue()
 
-    def _rip_done(self) -> None:
+    def _on_rip_worker_failed(self, message: str) -> None:
+        title = self._rip_queue[self._rip_queue_pos]
+        self._log(f"Title {title.index} failed: {message}")
+        self._rip_results.append((title, False, message))
+        self._cleanup_rip_thread()
+        self._rip_queue_pos += 1
+        self._rip_next_in_queue()
+
+    def _on_rip_worker_cancelled(self) -> None:
+        title = self._rip_queue[self._rip_queue_pos]
+        self._rip_results.append((title, False, "cancelled"))
+        self._batch_cancelled = True
+        self._cleanup_rip_thread()
+        self._finish_rip_batch()
+
+    def _finish_rip_batch(self) -> None:
+        # Deliberately not resetting the progress bar here: after a
+        # successful batch it should keep showing the last title's 100%
+        # rather than snapping back to empty. _rip_next_in_queue() already
+        # resets it per-title, and _start_rip() resets it for a new batch.
+        total = len(self._rip_queue)
+        successes = sum(1 for _, ok, _ in self._rip_results if ok)
+        failed = [t for t, ok, _ in self._rip_results if not ok]
+
+        if self._batch_cancelled:
+            self.status_label.setText(f"Cancelled - {successes}/{total} title(s) ripped.")
+            self._log(f"Batch cancelled after {successes}/{total} title(s).")
+        else:
+            self.status_label.setText(f"Done - {successes}/{total} title(s) ripped.")
+            self._log(f"Batch finished: {successes}/{total} title(s) ripped.")
+            if failed and successes == 0:
+                QMessageBox.critical(
+                    self, "Rip failed", f"All {total} title(s) failed. See log for details."
+                )
+            elif failed:
+                QMessageBox.warning(
+                    self,
+                    "Some titles failed",
+                    f"{len(failed)} of {total} title(s) failed. See log for details.",
+                )
+
         self.rip_btn.setEnabled(True)
         self.scan_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
