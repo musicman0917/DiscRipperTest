@@ -145,11 +145,18 @@ def _read_volume_label(drive: str) -> str | None:
     import ctypes
 
     root = drive_root(drive)
-    volume_name_buf = ctypes.create_unicode_buffer(261)
+    # GetVolumeInformationW's nVolumeNameSize wants the buffer size in
+    # *characters*, not bytes. ctypes.sizeof() on a unicode buffer returns
+    # bytes (261 chars * 2 bytes/char on Windows = 522) - passing that told
+    # the API the buffer was twice as large as it really is, a heap buffer
+    # overflow. Using the same literal for both the buffer and the size
+    # argument keeps them from ever being able to drift apart like that.
+    buffer_chars = 261
+    volume_name_buf = ctypes.create_unicode_buffer(buffer_chars)
     ok = ctypes.windll.kernel32.GetVolumeInformationW(  # type: ignore[attr-defined]
         ctypes.c_wchar_p(root),
         volume_name_buf,
-        ctypes.sizeof(volume_name_buf),
+        buffer_chars,
         None,
         None,
         None,

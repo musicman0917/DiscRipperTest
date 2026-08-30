@@ -254,3 +254,40 @@ def test_scan_bluray_populates_disc_label(tmp_path, fake_ffprobe_env):
     ffprobe = fake_ffprobe_env({"playlist:0": {"exit": 0, "stdout": _ffprobe_json(2700)}})
     result = disc.scan_disc(str(tmp_path), ffprobe)
     assert result.label == "Yu Yu Hakusho: Season 4, Disc 1"
+
+
+class _FakeKernel32:
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def GetVolumeInformationW(self, root, buf, size, *rest):
+        self.calls.append((root, buf, size))
+        buf.value = "TESTLABEL"
+        return 1
+
+
+class _FakeWindll:
+    def __init__(self):
+        self.kernel32 = _FakeKernel32()
+
+
+def test_read_volume_label_passes_character_count_not_byte_size(monkeypatch):
+    # Regression test for a real heap buffer overflow: GetVolumeInformationW's
+    # size argument must be the buffer's *character* capacity (261), but the
+    # original code passed ctypes.sizeof(buf) - the buffer's *byte* size
+    # (522, since Windows wide chars are 2 bytes) - telling the Win32 API
+    # the buffer was twice as large as it actually was. Confirmed on real
+    # hardware: the same physical disc's volume label came back different
+    # (a dropped character) across separate scans, consistent with heap
+    # corruption from writing past the buffer.
+    import ctypes as ctypes_module
+
+    monkeypatch.setattr(disc.sys, "platform", "win32")
+    fake_windll = _FakeWindll()
+    monkeypatch.setattr(ctypes_module, "windll", fake_windll, raising=False)
+
+    label = disc._read_volume_label("G:")
+
+    assert label == "TESTLABEL"
+    _, buf, size = fake_windll.kernel32.calls[0]
+    assert size == len(buf) == 261
