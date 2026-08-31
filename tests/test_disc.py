@@ -93,6 +93,25 @@ def test_scan_dvd_stops_at_first_gap(tmp_path, fake_ffprobe_env):
     assert result.titles[1].audio_tracks[0].language == "eng"
 
 
+def test_dvd_device_path_uses_raw_device_syntax_on_windows(monkeypatch):
+    # Confirmed on real hardware: "G:\\" fails with "libdvdnav: Unable to
+    # open device file" even though Explorer and filesystem-level reads
+    # work fine on that path - CSS's authentication handshake needs raw
+    # block-device access, which Windows only grants via "\\.\G:", not a
+    # normal directory open. "\\.\G:" opened and read the disc
+    # successfully in the same test.
+    monkeypatch.setattr(disc.sys, "platform", "win32")
+    assert disc.dvd_device_path("G:") == r"\\.\G:"
+    assert disc.dvd_device_path("G:\\") == r"\\.\G:"
+    assert disc.dvd_device_path("G:/") == r"\\.\G:"
+
+
+def test_dvd_device_path_falls_back_off_windows(tmp_path):
+    # No raw-device syntax exists to test off Windows - falls back to the
+    # plain filesystem path so this stays callable in dev/test.
+    assert disc.dvd_device_path(str(tmp_path)) == disc.drive_root(str(tmp_path))
+
+
 def test_scan_dvd_missing_disc_raises_scan_error(tmp_path, fake_ffprobe_env):
     (tmp_path / "VIDEO_TS").mkdir()
     ffprobe = fake_ffprobe_env({"default": {"exit": 1, "stdout": "", "stderr": "I/O error\n"}})

@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .disc import drive_root
+from .disc import drive_root, dvd_device_path
 from .models import Disc, DiscType, Title, Track
 
 
@@ -41,10 +41,10 @@ class RipCancelled(RuntimeError):
 
 
 def _disc_input_target(disc: Disc) -> str:
-    root = drive_root(disc.drive_letter)
     if disc.disc_type is DiscType.BLURAY:
+        root = drive_root(disc.drive_letter)
         return "bluray:" + root.replace("\\", "/")
-    return root
+    return dvd_device_path(disc.drive_letter)
 
 
 def build_rip_command(

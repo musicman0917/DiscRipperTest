@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import disc as disc_module
 from src import ripper as ripper_module
 from src.models import Disc, DiscType, Title, Track, TrackType
 from src.ripper import (
@@ -64,6 +65,18 @@ def test_build_rip_command_includes_xerror():
     title = Title(index=1, duration_seconds=100)
     cmd = build_rip_command("ffmpeg", _dvd_disc(), title, _tracks(), Path("out.mkv"))
     assert "-xerror" in cmd
+
+
+def test_build_rip_command_dvd_uses_raw_device_path_on_windows(monkeypatch):
+    # Regression: build_rip_command used to pass "G:\" (a plain directory
+    # path) as -i, which failed on real hardware with "libdvdnav: Unable
+    # to open device file" - CSS needs raw block-device access via
+    # "\\.\G:", confirmed working on the same disc.
+    monkeypatch.setattr(disc_module.sys, "platform", "win32")
+    title = Title(index=1, duration_seconds=100)
+    cmd = build_rip_command("ffmpeg", _dvd_disc(), title, _tracks(), Path("out.mkv"))
+    input_arg = cmd[cmd.index("-i") + 1]
+    assert input_arg == r"\\.\G:"
 
 
 def test_build_rip_command_bluray():

@@ -99,6 +99,31 @@ def drive_root(drive: str) -> str:
     return drive.rstrip("\\/") + os.sep
 
 
+def dvd_device_path(drive: str) -> str:
+    """The path to pass to ffmpeg's dvdvideo demuxer for DVD access.
+
+    Confirmed on real hardware: a plain drive-letter path ("G:\\") fails
+    with "libdvdnav: Unable to open device file", even though Explorer and
+    ffprobe's own filesystem-level VIDEO_TS reads work fine on that same
+    path - CSS's authentication handshake needs low-level block-device
+    access, which Windows only grants through the raw device path syntax
+    ("\\\\.\\G:"), not a normal directory open. "\\\\.\\G:" then opened
+    and read the disc successfully in the same test.
+
+    Blu-ray doesn't need this (the bluray: protocol/libbluray handles its
+    own device access), so this is DVD-only - see _disc_input_target() in
+    ripper.py and the DVD branch of _scan_dvd().
+
+    Falls back to drive_root() off Windows, where there's no equivalent
+    raw-device syntax to test against and this only needs to stay
+    importable/callable for non-Windows dev/test environments.
+    """
+    if sys.platform != "win32":
+        return drive_root(drive)
+    letter = drive.rstrip("\\/:")
+    return f"\\\\.\\{letter}:"
+
+
 def detect_disc_type(drive: str) -> DiscType | None:
     """Filesystem-only check - both VIDEO_TS and BDMV are plain directories
     on the disc's filesystem (UDF/ISO9660), readable without any ffmpeg
@@ -266,13 +291,13 @@ def _scan_dvd(
     # The dvdvideo demuxer's own range check is `title > tt_srpt->nr_of_srpts`
     # (source: libavformat/dvdvideodec.c), so valid titles are a contiguous
     # 1..N run - one failure means "past the end", no need to keep probing.
-    root = drive_root(drive)
+    device_path = dvd_device_path(drive)
     titles: list[Title] = []
     for title_num in range(1, 100):
         if on_progress:
             on_progress(title_num, None, f"Reading DVD title {title_num}...")
         data, stderr = _run_ffprobe_json(
-            ffprobe_path, ["-f", "dvdvideo", "-title", str(title_num), root]
+            ffprobe_path, ["-f", "dvdvideo", "-title", str(title_num), device_path]
         )
         if data is None:
             if title_num == 1:
