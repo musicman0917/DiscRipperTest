@@ -56,6 +56,16 @@ def test_build_rip_command_dvd():
     assert "-progress" in cmd and cmd[cmd.index("-progress") + 1] == "pipe:1"
 
 
+def test_build_rip_command_includes_xerror():
+    # Regression: confirmed on real hardware that without -xerror, ffmpeg
+    # can exit 0 despite a fatal demux read failure (e.g. the drive never
+    # opened), which Ripper.rip()'s exit-code check would silently treat
+    # as a successful rip. -xerror makes ffmpeg's own exit code honest.
+    title = Title(index=1, duration_seconds=100)
+    cmd = build_rip_command("ffmpeg", _dvd_disc(), title, _tracks(), Path("out.mkv"))
+    assert "-xerror" in cmd
+
+
 def test_build_rip_command_bluray():
     title = Title(index=800, duration_seconds=7200)
     cmd = build_rip_command("ffmpeg", _bluray_disc(), title, _tracks(), Path("out.mkv"))

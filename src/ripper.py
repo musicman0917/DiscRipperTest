@@ -57,7 +57,14 @@ def build_rip_command(
     if not tracks:
         raise ValueError("At least one track must be selected to rip")
 
-    cmd = [ffmpeg_path, "-y", "-nostdin", "-loglevel", "error"]
+    # -xerror: without it, ffmpeg treats a run-time error (a failed demux
+    # read, e.g. the drive/device never actually opened) as non-fatal by
+    # default and can still exit 0 having written nothing real - which
+    # would make Ripper.rip()'s exit-code check silently report success on
+    # a broken rip. Confirmed on real hardware: a DVD that failed to open
+    # at all ("libdvdnav: Unable to open device file") still logged
+    # "Title 1 finished." because ffmpeg's own process exited 0.
+    cmd = [ffmpeg_path, "-y", "-nostdin", "-xerror", "-loglevel", "error"]
 
     if disc.disc_type is DiscType.DVD:
         cmd += ["-f", "dvdvideo", "-title", str(title.index)]
